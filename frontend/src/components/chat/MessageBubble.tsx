@@ -1,0 +1,27 @@
+import { ChevronDown, FileText, Sparkles, User } from 'lucide-react'
+import ReactMarkdown from 'react-markdown'
+import remarkGfm from 'remark-gfm'
+import { filterCitedSources } from '../../services/chat'
+import type { ChatMessage, Source } from '../../types/api'
+
+function SourceCard({ source }: { source: Source }) {
+  return <div className="source-card">
+    <div className="source-title"><span className="source-number">{source.citation}</span><FileText size={15} /><strong>{source.filename}</strong></div>
+    <div className="source-meta"><span>片段 {source.chunk_index + 1}</span>{source.page_number != null && <span>第 {source.page_number} 页</span>}{source.similarity != null && <span>相似度 {source.similarity.toFixed(2)}</span>}</div>
+    <p>{source.content}</p>
+  </div>
+}
+
+export function MessageBubble({ message }: { message: ChatMessage }) {
+  const assistant = message.role === 'assistant'
+  const citedSources = assistant ? filterCitedSources(message.content, message.sources) : []
+  return <article className={`message-row ${assistant ? 'assistant-row' : 'user-row'}`}>
+    <div className={`message-avatar ${assistant ? 'ai-avatar' : 'human-avatar'}`}>{assistant ? <Sparkles size={19} /> : <User size={16} />}</div>
+    <div className="message-body"><div className="message-author">{assistant ? 'NodAgent' : '你'}</div>
+      {message.content ? <div className="message-content markdown"><ReactMarkdown remarkPlugins={[remarkGfm]}>{message.content}</ReactMarkdown></div> : message.pending && !message.interrupt ? <div className="typing"><span /><span /><span /></div> : null}
+      {message.error && <div className="message-error" role="alert">{message.error}</div>}
+      {message.pending && message.content && !message.interrupt && <span className="stream-cursor" aria-label="正在生成" />}
+      {citedSources.length > 0 && <details className="sources"><summary><FileText size={15} /> 引用来源（{citedSources.length}） <ChevronDown size={15} className="source-chevron" /></summary><div className="source-list">{citedSources.map(source => <SourceCard key={source.chunk_id} source={source} />)}</div></details>}
+    </div>
+  </article>
+}
