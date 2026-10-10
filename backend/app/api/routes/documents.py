@@ -50,27 +50,27 @@ from backend.app.services.task_dispatcher import (
 router = APIRouter(
     prefix=(
         "/workspaces/"
-        "{workspace_id}/documents"
-    ),
+        "{workspace_id}/documents"#workspace_id 是路径参数，表示文档属于哪个工作空间。
+    ),#例如GET /api/workspaces/3/documents
     tags=[
-        "documents",
+        "documents",#用于 Swagger 接口文档分类。打开 /docs 时，这个接口会出现在 documents 分组下；它不影响实际访问地址。
     ],
 )
 
 
-UPLOAD_DIR = Path(
+UPLOAD_DIR = Path(#上传的原始文件保存在项目/data/uploads/下
     "data/uploads"
 )
 
 
-ALLOWED_SUFFIXES = {
+ALLOWED_SUFFIXES = {#允许的文件类型
     ".pdf",
     ".txt",
     ".md",
 }
 
 
-def get_workspace_or_404(
+def get_workspace_or_404(#按id查询工作空间，如果不存在则抛出 404 异常
     db: Session,
     workspace_id: int,
 ) -> Workspace:
@@ -94,7 +94,7 @@ def get_workspace_or_404(
     return workspace
 
 
-def get_document_or_404(
+def get_document_or_404(#按id查询文档，如果不存在则抛出 404 异常
     db: Session,
     workspace_id: int,
     document_id: int,
@@ -104,7 +104,7 @@ def get_document_or_404(
         .filter(
             Document.id
             == document_id,
-            Document.workspace_id
+            Document.workspace_id#文档必须属于指定的工作空间
             == workspace_id,
         )
         .first()
@@ -120,9 +120,9 @@ def get_document_or_404(
 
     return document
 
-
+#获取工作空间下的文档列表
 @router.get(
-    "",
+    "",#GET /api/workspaces/{workspace_id}/documents
     response_model=list[
         DocumentResponse
     ],
@@ -150,12 +150,12 @@ def list_documents(
         .all()
     )
 
-
+#上传文档接口
 @router.post(
-    "",
+    "",#POST /api/workspaces/{workspace_id}/documents
     response_model=DocumentResponse,
     status_code=(
-        status.HTTP_202_ACCEPTED
+        status.HTTP_202_ACCEPTED#上传文档后，返回 202 Accepted，表示请求已接受，但处理尚未完成。客户端可以通过 /status 接口查询处理状态。
     ),
 )
 def upload_document(
@@ -165,12 +165,12 @@ def upload_document(
         get_db
     ),
 ):
-    get_workspace_or_404(
+    get_workspace_or_404(#确认工作空间存在
         db=db,
         workspace_id=workspace_id,
     )
 
-    original_filename = (
+    original_filename = (#检查文件后缀
         file.filename
         or "document"
     )
@@ -200,7 +200,7 @@ def upload_document(
         exist_ok=True,
     )
 
-    stored_filename = (
+    stored_filename = (#生成一个唯一的文件名，避免文件名冲突
         f"{uuid4().hex}"
         f"{suffix}"
     )
@@ -230,7 +230,7 @@ def upload_document(
             detail="Failed to save file",
         ) from exc
 
-    if (
+    if (#检查文件是否为空
         not file_path.exists()
         or file_path.stat().st_size == 0
     ):
@@ -244,7 +244,7 @@ def upload_document(
             detail="Uploaded file is empty",
         )
 
-    document = Document(
+    document = Document(#创建一个 Document 实例，保存到数据库
         workspace_id=workspace_id,
         filename=original_filename,
         file_path=str(
@@ -282,7 +282,7 @@ def upload_document(
         ) from exc
 
     try:
-        dispatch_document_processing(
+        dispatch_document_processing(#投递后台解析任务，通常会将任务提交给 Celery Worker 或其他任务队列
             db=db,
             document=document,
         )
@@ -290,9 +290,9 @@ def upload_document(
     except TaskDispatchError as exc:
         raise HTTPException(
             status_code=(
-                status.HTTP_503_SERVICE_UNAVAILABLE
+                status.HTTP_503_SERVICE_UNAVAILABLE#任务队列或 Worker 不可用
             ),
-            detail=(
+            detail=(#文件和数据库记录已经创建成功，但处理任务没有成功进入队列
                 "Document was uploaded, "
                 "but processing could not "
                 "be queued"
@@ -303,9 +303,9 @@ def upload_document(
 
     return document
 
-
+#重新处理文档接口，对已有文档手动重新解析（比如上次解析失败）
 @router.post(
-    "/{document_id}/process",
+    "/{document_id}/process",#POST /api/workspaces/{workspace_id}/documents/{document_id}/process
     response_model=(
         DocumentProcessingResponse
     ),
@@ -370,7 +370,7 @@ def process_document_again(
         ),
     )
 
-
+#查询文档处理状态接口，返回文档的当前处理状态、任务 ID 和错误信息（如果有）
 @router.get(
     "/{document_id}/status",
     response_model=(
@@ -405,9 +405,9 @@ def get_document_status(
         ),
     )
 
-
+#查询文档的分块内容接口，返回文档的所有分块信息，按 chunk_index 升序排列
 @router.get(
-    "/{document_id}/chunks",
+    "/{document_id}/chunks",#GET /api/workspaces/{workspace_id}/documents/{document_id}/chunks
     response_model=list[
         DocumentChunkResponse
     ],
@@ -443,9 +443,9 @@ def list_document_chunks(
         .all()
     )
 
-
+#删除文档接口，删除文档及其分块内容，同时删除原始文件。注意：如果文档正在处理或被其他操作占用，会返回 409 Conflict。
 @router.delete(
-    "/{document_id}",
+    "/{document_id}",#DELETE /api/workspaces/{workspace_id}/documents/{document_id}
     status_code=(
         status.HTTP_204_NO_CONTENT
     ),

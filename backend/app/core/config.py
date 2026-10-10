@@ -134,6 +134,26 @@ LLM_MODEL = os.getenv(
 )
 
 
+LLM_MAX_TOKENS = int(
+    os.getenv(
+        "LLM_MAX_TOKENS",
+        "4096",
+    )
+)
+
+
+# Optional: web search returns a safe unavailable response when either value
+# is absent. Do not validate them at application startup.
+TAVILY_MCP_URL = os.getenv(
+    "TAVILY_MCP_URL"
+)
+
+
+TAVILY_API_KEY = os.getenv(
+    "TAVILY_API_KEY"
+)
+
+
 if not LLM_BASE_URL:
     raise RuntimeError(
         "LLM_BASE_URL is not configured"
@@ -149,6 +169,12 @@ if not LLM_API_KEY:
 if not LLM_MODEL:
     raise RuntimeError(
         "LLM_MODEL is not configured"
+    )
+
+
+if LLM_MAX_TOKENS <= 0:
+    raise RuntimeError(
+        "LLM_MAX_TOKENS must be a positive integer"
     )
 
 
@@ -179,3 +205,37 @@ CELERY_RESULT_BACKEND = os.getenv(
     "CELERY_RESULT_BACKEND",
     "redis://localhost:16379/1",
 )
+
+
+# GitHub MCP is optional.  Do not fail application startup when it is absent:
+# the external agent can still answer weather/time and web-search questions.
+GITHUB_MCP_URL = os.getenv(
+    "GITHUB_MCP_URL",
+    "http://127.0.0.1:8082",
+).strip()
+
+GITHUB_MCP_TIMEOUT_SECONDS = float(
+    os.getenv(
+        "GITHUB_MCP_TIMEOUT_SECONDS",
+        "20",
+    )
+)
+
+GITHUB_MCP_INIT_TIMEOUT_SECONDS = float(
+    os.getenv(
+        "GITHUB_MCP_INIT_TIMEOUT_SECONDS",
+        "10",
+    )
+)
+
+
+if GITHUB_MCP_TIMEOUT_SECONDS <= 0:
+    raise RuntimeError(
+        "GITHUB_MCP_TIMEOUT_SECONDS must be positive"
+    )
+
+
+if GITHUB_MCP_INIT_TIMEOUT_SECONDS <= 0:
+    raise RuntimeError(
+        "GITHUB_MCP_INIT_TIMEOUT_SECONDS must be positive"
+    )

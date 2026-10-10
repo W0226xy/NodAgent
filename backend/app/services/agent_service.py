@@ -593,6 +593,8 @@ async def _stream_graph_run(
     answer_parts: List[str] = []
 
     final_answer = ""
+    emitted_token_count = 0
+    emitted_char_count = 0
 
     try:
         async for part in agent.astream(
@@ -613,6 +615,20 @@ async def _stream_graph_run(
                 update_data = part[
                     "data"
                 ]
+
+                external_update = update_data.get("external")
+                if isinstance(external_update, dict):
+                    external_status = external_update.get("external_status")
+                    if isinstance(external_status, dict):
+                        state = external_status.get("state")
+                        if state == "succeeded":
+                            message = f"已找到 {external_status.get('url_count', 0)} 条网页来源。"
+                        elif state in {"failed", "no_results"}:
+                            message = str(external_status.get("message") or "联网搜索暂时不可用。")
+                        else:
+                            message = ""
+                        if message:
+                            yield {"event": "status", "data": {"message": message, "state": state}}
 
                 chat_update = (
                     update_data.get(
@@ -681,6 +697,8 @@ async def _stream_graph_run(
                 answer_parts.append(
                     token
                 )
+                emitted_token_count += 1
+                emitted_char_count += len(token)
 
                 yield {
                     "event": "token",
@@ -749,6 +767,12 @@ async def _stream_graph_run(
             snapshot_sources
         )
         sources = filter_answer_sources(answer, sources)
+        answer_incomplete = bool(
+            snapshot.values.get(
+                "answer_incomplete",
+                False,
+            )
+        )
 
         message_id = (
             save_assistant_message(
@@ -759,6 +783,17 @@ async def _stream_graph_run(
                 sources=sources,
             )
         )
+
+        # Chat-model tokens are streamed before the graph node has finished
+        # normalizing web [n] markers into original Markdown URLs. Replace the
+        # provisional text with the persisted final answer so stream and JSON
+        # responses have identical citation rendering.
+        yield {
+            "event": "answer",
+            "data": {
+                "answer": answer,
+            },
+        }
 
         if sources:
             yield {
@@ -771,6 +806,16 @@ async def _stream_graph_run(
                 },
             }
 
+        logger.warning(
+            "final_answer_completed request_id=%s thread_id=%s final_chars=%d emitted_chunks=%d "
+            "emitted_chars=%d sources=%d incomplete=%s",
+            context.get("request_id", "unknown"), thread_id,
+            len(answer),
+            emitted_token_count,
+            emitted_char_count,
+            len(sources),
+            answer_incomplete,
+        )
         yield {
             "event": "done",
             "data": {
@@ -778,12 +823,19 @@ async def _stream_graph_run(
                 "message_id": (
                     message_id
                 ),
+                "incomplete": answer_incomplete,
             },
         }
+        logger.warning(
+            "SSE done sent thread_id=%s incomplete=%s",
+            thread_id,
+            answer_incomplete,
+        )
 
     except Exception as exc:
         logger.warning(
-            "Main graph stream failed (%s)",
+            "Main graph stream failed before done thread_id=%s (%s)",
+            thread_id,
             type(exc).__name__,
         )
 

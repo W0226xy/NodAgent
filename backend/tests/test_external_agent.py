@@ -42,7 +42,9 @@ class FakeAgent:
     async def ainvoke(
         self,
         payload,
+        config=None,
     ):
+        del payload, config
         return {
             "messages": [
                 AIMessage(
@@ -109,6 +111,7 @@ class ExternalAgentTests(
                 "GitHub MCP is unavailable"
             )
         )
+        web_search_factory = Mock()
 
         with (
             patch.object(
@@ -120,6 +123,11 @@ class ExternalAgentTests(
                 external_agent,
                 "create_github_mcp_client",
                 github_factory,
+            ),
+            patch.object(
+                external_agent,
+                "create_web_search_client",
+                web_search_factory,
             ),
             patch.object(
                 external_agent,
@@ -148,6 +156,7 @@ class ExternalAgentTests(
             "模拟的外部工具回答",
         )
         github_factory.assert_not_called()
+        web_search_factory.assert_not_called()
 
     async def test_github_task_does_not_create_local_client(self):
         local_factory = Mock()
@@ -190,6 +199,61 @@ class ExternalAgentTests(
             "模拟的外部工具回答",
         )
         local_factory.assert_not_called()
+
+    async def test_github_failure_does_not_block_available_web_search(self):
+        github_factory = Mock(
+            side_effect=RuntimeError(
+                "GitHub MCP is unavailable"
+            )
+        )
+
+        with (
+            patch.object(
+                external_agent,
+                "TAVILY_MCP_URL",
+                "https://mcp.example.test/mcp/",
+            ),
+            patch.object(
+                external_agent,
+                "TAVILY_API_KEY",
+                "test-key",
+            ),
+            patch.object(
+                external_agent,
+                "create_github_mcp_client",
+                github_factory,
+            ),
+            patch.object(
+                external_agent,
+                "create_web_search_client",
+                return_value="web-search",
+            ),
+            patch.object(
+                external_agent,
+                "MCPAdapter",
+                side_effect=FakeMCPAdapter,
+            ),
+            patch.object(
+                external_agent,
+                "get_chat_model",
+                return_value=object(),
+            ),
+            patch.object(
+                external_agent,
+                "create_agent",
+                return_value=FakeAgent(),
+            ),
+        ):
+            answer = await external_agent.run_external_agent(
+                "搜索 GitHub 上的 RAG 仓库",
+                need_web_search=True,
+            )
+
+        self.assertEqual(
+            answer,
+            "模拟的外部工具回答",
+        )
+        github_factory.assert_called_once()
 
     async def test_local_mcp_failure_returns_safe_answer(self):
         with (

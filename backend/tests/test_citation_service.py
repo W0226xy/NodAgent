@@ -3,6 +3,7 @@ import unittest
 from backend.app.services.citation_service import (
     extract_citation_numbers,
     filter_cited_sources,
+    render_web_citations,
 )
 
 
@@ -61,6 +62,51 @@ class CitationServiceTests(unittest.TestCase):
 
     def test_extract_citation_numbers(self):
         self.assertEqual(extract_citation_numbers("[1][3][1]"), [1, 3])
+
+    def test_web_citation_becomes_one_markdown_link(self):
+        sources = [
+            {
+                "source_type": "web",
+                "source_number": 1,
+                "citation": "[1]",
+                "document_id": 0,
+                "chunk_id": 1,
+                "filename": "Official",
+                "title": "Official announcement",
+                "url": "https://example.com/news",
+            },
+            source(2),
+        ]
+        answer = render_web_citations(
+            "网页事实 [1]，重复引用 [1]；本地文档 [2]。",
+            sources,
+        )
+
+        self.assertEqual(
+            answer,
+            "网页事实 [Official announcement](https://example.com/news)，"
+            "重复引用 ；本地文档 [2]。",
+        )
+        cited = filter_cited_sources(answer, sources)
+        self.assertEqual(
+            [item["source_number"] for item in cited],
+            [2, 1],
+        )
+
+    def test_unsafe_web_url_is_not_a_citable_source(self):
+        unsafe = {
+            "source_type": "web",
+            "source_number": 1,
+            "citation": "[1]",
+            "document_id": 0,
+            "chunk_id": 1,
+            "filename": "Unsafe",
+            "url": "javascript:alert(1)",
+        }
+        self.assertEqual(
+            filter_cited_sources("[1]", [unsafe]),
+            [],
+        )
 
 
 if __name__ == "__main__":

@@ -177,6 +177,7 @@ button:disabled { cursor: not-allowed; opacity: .5; }
 .status-processing { background: #fff4df; color: #a86b1e; }
 .status-completed { background: #e8f7ef; color: #248452; }
 .status-failed { background: #ffefed; color: #b44b47; }
+.message-status { margin-top: 8px; color: #687586; font-size: 13px; }
 .icon-button { width: 30px; height: 30px; display: grid; place-items: center; border: 0; border-radius: 50%; background: transparent; color: #919cab; }
 .icon-button:hover { background: #eef3fa; color: #326ebf; }
 .document-error { padding: 0 18px 12px 70px; color: #b44b47; font-size: 11px; }

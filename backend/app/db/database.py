@@ -4,14 +4,14 @@ from sqlalchemy.orm import declarative_base, sessionmaker
 from backend.app.core.config import DATABASE_URL
 
 
-engine = create_engine(
+engine = create_engine(#链接数据库
     DATABASE_URL,
     echo=True,
     pool_pre_ping=True,
 )
 
 
-SessionLocal = sessionmaker(
+SessionLocal = sessionmaker(#创建每次操作用的数据库会话
     autocommit=False,
     autoflush=False,
     bind=engine,
@@ -21,7 +21,7 @@ SessionLocal = sessionmaker(
 Base = declarative_base()
 
 
-def get_db():
+def get_db():#给每个 HTTP 请求自动提供并关闭会话
     db = SessionLocal()
 
     try:

@@ -2,7 +2,7 @@ import { useCallback, useEffect, useRef, useState } from 'react'
 import { ArrowUp, MessageSquare, Sparkles } from 'lucide-react'
 import { ConfirmationCard } from '../components/chat/ConfirmationCard'
 import { MessageBubble } from '../components/chat/MessageBubble'
-import { createThread, filterCitedSources, listMessages, listThreads, streamChat, streamErrorMessage } from '../services/chat'
+import { createThread, listMessages, listThreads, streamChat, streamErrorMessage } from '../services/chat'
 import type { ChatMessage, Interrupt, Source, Thread } from '../types/api'
 
 const storageKey = (workspaceId: number, userId: string) => `nodagent.thread.${workspaceId}.${userId}`
@@ -72,7 +72,7 @@ export function ChatPage({ workspaceId, userId, selectedThreadId, newChatRequest
       const restored = localStorage.getItem(interruptKey(workspaceId, userId, thread.thread_id))
       let interrupt: Interrupt | null = null
       try { if (restored) interrupt = JSON.parse(restored) as Interrupt } catch { localStorage.removeItem(interruptKey(workspaceId, userId, thread.thread_id)) }
-      setMessages([...items.map(item => ({ key: String(item.id), role: item.role === 'user' ? 'user' as const : 'assistant' as const, content: item.content, sources: filterCitedSources(item.content, item.sources || []) })), ...(interrupt ? [{ key: interrupt.interrupt_id, role: 'assistant' as const, content: '', sources: [], interrupt }] : [])])
+      setMessages([...items.map(item => ({ key: String(item.id), role: item.role === 'user' ? 'user' as const : 'assistant' as const, content: item.content, sources: item.sources || [] })), ...(interrupt ? [{ key: interrupt.interrupt_id, role: 'assistant' as const, content: '', sources: [], interrupt }] : [])])
     }).catch(err => { if (active) setError(err instanceof Error ? err.message : String(err)) })
     return () => { active = false }
   }, [workspaceId, userId, thread?.thread_id])
@@ -106,11 +106,30 @@ export function ChatPage({ workspaceId, userId, selectedThreadId, newChatRequest
     try {
       await streamChat(workspaceId, { user_id: userId, thread_id: activeThread.thread_id, ...payload }, ({ event, data }) => {
         const value = data as Record<string, unknown>
+        const finalAnswer = typeof value.answer === 'string' ? value.answer : null
         if (event === 'token') setMessages(items => items.map(item => item.key === key ? { ...item, content: item.content + String(value.content || '') } : item))
-        if (event === 'sources') setMessages(items => items.map(item => item.key === key ? { ...item, sources: filterCitedSources(item.content, (value.sources as Source[]) || []) } : item))
+        if (event === 'answer' && finalAnswer !== null) setMessages(items => items.map(item => item.key === key ? { ...item, content: finalAnswer } : item))
+        if (event === 'sources') setMessages(items => items.map(item => item.key === key ? { ...item, sources: (value.sources as Source[]) || [] } : item))
+        if (event === 'status') setMessages(items => items.map(item => item.key === key ? { ...item, status: typeof value.message === 'string' ? value.message : undefined } : item))
         if (event === 'interrupt') { terminal = true; localStorage.setItem(interruptKey(workspaceId, userId, activeThread.thread_id), JSON.stringify(value)); setMessages(items => items.map(item => item.key === key ? { ...item, pending: false, interrupt: value as unknown as Interrupt } : item)) }
         if (event === 'resume') setMessages(items => items.map(item => item.key === key ? { ...item, interrupt: undefined, content: '', sources: [] } : item))
-        if (event === 'done') { terminal = true; localStorage.removeItem(interruptKey(workspaceId, userId, activeThread.thread_id)); setMessages(items => items.map(item => item.key === key ? { ...item, pending: false, interrupt: undefined } : item)); void listThreads(workspaceId, userId).then(items => { setThreads(items); setThread(current => items.find(item => item.thread_id === current?.thread_id) || current) }) }
+        if (event === 'done') {
+          terminal = true
+          const incomplete = value.incomplete === true
+          if (incomplete) console.warn('[chat:sse] model output ended due to length limit')
+          localStorage.removeItem(interruptKey(workspaceId, userId, activeThread.thread_id))
+          setMessages(items => items.map(item => item.key === key ? {
+            ...item,
+            pending: false,
+            interrupt: undefined,
+            error: incomplete ? '回答因输出长度限制未完成，请回复“继续”。' : undefined,
+            status: undefined,
+          } : item))
+          void listThreads(workspaceId, userId).then(items => {
+            setThreads(items)
+            setThread(current => items.find(item => item.thread_id === current?.thread_id) || current)
+          })
+        }
         if (event === 'error') { terminal = true; setMessages(items => items.map(item => item.key === key ? { ...item, pending: false, error: streamErrorMessage(data) } : item)) }
       }, controller.signal)
     } catch (err) {

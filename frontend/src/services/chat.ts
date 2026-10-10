@@ -30,7 +30,7 @@ export function filterCitedSources(answer: string, sources: Source[]): Source[] 
 
   const sourcesByNumber = new Map(sources.map(source => [source.source_number, source]))
   const seenChunks = new Set<string>()
-  return citedNumbers.flatMap(sourceNumber => {
+  const cited = citedNumbers.flatMap(sourceNumber => {
     const source = sourcesByNumber.get(sourceNumber)
     if (!source) return []
     const chunkKey = `${source.document_id}:${source.chunk_id}`
@@ -38,6 +38,16 @@ export function filterCitedSources(answer: string, sources: Source[]): Source[] 
     seenChunks.add(chunkKey)
     return [source]
   })
+
+  for (const source of sources) {
+    if (source.source_type !== 'web' || !source.url || !answer.includes(source.url)) continue
+    const chunkKey = `${source.document_id}:${source.chunk_id}`
+    if (seenChunks.has(chunkKey)) continue
+    seenChunks.add(chunkKey)
+    cited.push(source)
+  }
+
+  return cited
 }
 
 // POST streaming cannot use EventSource; decode the response body as SSE frames.
@@ -57,6 +67,8 @@ export async function streamChat(
   const decoder = new TextDecoder()
   let buffer = ''
   let terminal = false
+  let receivedEvents = 0
+  let receivedTokenChars = 0
   const dispatch = (frame: string) => {
     let event = 'message'
     const data: string[] = []
@@ -68,6 +80,12 @@ export async function streamChat(
     const raw = data.join('\n')
     let parsed: unknown
     try { parsed = JSON.parse(raw) } catch { parsed = raw }
+    receivedEvents += 1
+    if (event === 'token' && parsed && typeof parsed === 'object' && 'content' in parsed) {
+      receivedTokenChars += String((parsed as { content?: unknown }).content || '').length
+    }
+    if (event === 'done') console.info('[chat:sse] done received', { receivedEvents, receivedTokenChars })
+    if (event === 'error') console.warn('[chat:sse] error received before done', { receivedEvents, receivedTokenChars })
     onEvent({ event, data: parsed })
     if (event === 'done' || event === 'interrupt' || event === 'error') terminal = true
   }
@@ -84,5 +102,6 @@ export async function streamChat(
   }
   buffer += decoder.decode()
   if (buffer.trim()) dispatch(buffer.replace(/\r\n/g, '\n'))
+  if (!terminal) console.warn('[chat:sse] connection closed before terminal event', { receivedEvents, receivedTokenChars })
   if (!terminal) throw new Error('连接中断，未收到完成事件。请查看会话记录后再重试。')
 }

@@ -1,9 +1,34 @@
+import logging
+
 from celery import Celery
 
 from backend.app.core.config import (
     CELERY_BROKER_URL,
     CELERY_RESULT_BACKEND,
 )
+from backend.app.services.mcp_service import (
+    get_github_mcp_diagnostic,
+)
+
+
+logger = logging.getLogger(
+    __name__
+)
+
+
+github_mcp_problem = get_github_mcp_diagnostic()
+
+if github_mcp_problem:
+    logger.warning(
+        "GitHub MCP unavailable in worker startup: %s. The current "
+        "document worker does not call GitHub MCP, and future external "
+        "tasks will degrade gracefully.",
+        github_mcp_problem,
+    )
+else:
+    logger.info(
+        "GitHub MCP configuration is present in worker startup."
+    )
 
 
 celery_app = Celery(

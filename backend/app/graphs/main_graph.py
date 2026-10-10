@@ -1,5 +1,6 @@
 import asyncio
 import logging
+import re
 from functools import lru_cache
 from typing import (
     Annotated,
@@ -40,7 +41,7 @@ from backend.app.agents.document_agent import (
     get_document_agent,
 )
 from backend.app.agents.knowledge_agent import (
-    get_knowledge_agent,
+    get_knowledge_agent,#
 )
 from backend.app.agents.memory_agent import (
     get_memory_agent,
@@ -57,11 +58,29 @@ from backend.app.services.document_action_service import (
 )
 from backend.app.services.llm_service import (
     get_chat_model,
+    get_finish_reason,
+    is_length_limited,
+)
+from backend.app.core.config import (
+    LLM_MODEL,
 )
 
 
 logger = logging.getLogger(__name__)
 
+
+#这份代码是 NodAgent 的主 LangGraph 工作流。
+#它决定一条用户消息要交给哪个专业 Agent 处理，并最终由 Chat Agent 整理为面向用户的回答。
+#用户消息
+  # → Router 判断意图
+  # → 专业节点处理
+  #    ├─ 知识库问答
+  #    ├─ 文档管理查询
+  #    ├─ 长期记忆管理
+  #    ├─ 外部 MCP / 联网搜索
+  #    └─ 删除文档（需人工确认）
+  # → Chat Agent 生成最终回答
+  # → 保存 checkpoint
 
 EXTERNAL_REQUEST_MARKERS = (
     "天气",
@@ -70,6 +89,12 @@ EXTERNAL_REQUEST_MARKERS = (
     "几点",
     "时间",
     "github",
+)
+
+WEB_SEARCH_MARKERS = (
+    "搜索", "查一下", "联网", "找资料", "给链接", "核实", "验证",
+    "最新", "最近", "新闻", "实时价格", "汇率", "股价", "比赛结果",
+    "航班", "verify", "search", "latest", "news",
 )
 
 KNOWLEDGE_FACT_MARKERS = (
@@ -86,9 +111,9 @@ KNOWLEDGE_FACT_MARKERS = (
     "how many",
 )
 
-
+#防止“文档事实问题”误走外部服务
 def should_route_fact_question_to_knowledge(
-    question: str,
+    question: str,#用户问题
 ) -> bool:
     """Keep stable facts out of the realtime/external path.
 
@@ -97,18 +122,44 @@ def should_route_fact_question_to_knowledge(
     wording, so protect that class of fact questions before graph routing.
     """
 
-    normalized = question.lower()
+    normalized = question.lower()#问题转小写
 
-    if any(
+    if any(#先检查问题里是否出现了明确属于外部实时服务的关键词
         marker in normalized
         for marker in EXTERNAL_REQUEST_MARKERS
     ):
         return False
 
-    return any(
+    return any(#检查是否包含知识库事实关键词
         marker in normalized
         for marker in KNOWLEDGE_FACT_MARKERS
     )
+
+#用户明确说“搜索、新闻、最新”时，强制联网
+def should_request_web_search(question: str) -> bool:
+    normalized = question.lower()
+    if any(marker in normalized for marker in EXTERNAL_REQUEST_MARKERS):
+        return False
+    return any(marker in normalized for marker in WEB_SEARCH_MARKERS)
+
+#
+def shift_citations(text: str, offset: int) -> str:
+    return re.sub(
+        r"\[(\d+)\]",
+        lambda match: f"[{int(match.group(1)) + offset}]",
+        text,
+    ) if offset > 0 else text
+
+
+def shift_web_sources(sources: List[Dict[str, Any]], offset: int) -> List[Dict[str, Any]]:
+    shifted_sources = []
+    for source in sources:
+        shifted = dict(source)
+        source_number = int(shifted["source_number"]) + offset
+        shifted["source_number"] = source_number
+        shifted["citation"] = f"[{source_number}]"
+        shifted_sources.append(shifted)
+    return shifted_sources
 
 
 RouteName = Literal[
@@ -120,28 +171,32 @@ RouteName = Literal[
     "delete_document",
 ]
 
-
+#整条工作流共享的状态
 class MainGraphState(
     TypedDict,
     total=False,
 ):
+    #完整对话消息，使用 add_messages 自动追加
     messages: Annotated[
         List[AnyMessage],
         add_messages,
     ]
-
+    #Router 最终决定走哪条路径
     route: RouteName
-
+    #Router 传给专业节点的任务描述，必须是完整、独立可理解的任务
     specialist_task: str
-
+    #专业 Agent 的返回结果
     specialist_answer: str
-
+    #结果来自哪个专业 Agent
     specialist_agent: str
+    #是否需要进行网页搜索
+    need_web_search: bool
+    #知识库的回答
+    knowledge_answer: str
 
     sources: List[
         Dict[str, Any]
     ]
-
     retrieved_sources: List[
         Dict[str, Any]
     ]
@@ -171,7 +226,20 @@ class MainGraphState(
         Any,
     ]
 
+    answer_incomplete: bool
 
+    external_status: Dict[str, Any]
+
+#Router：先让模型判断，再用规则兜底
+#Router 不能随意输出一段自然语言，而必须按规定返回结构化结果
+#比如：
+# {
+#   "route": "delete_document",
+#   "task": "删除 report.pdf。",
+#   "need_web_search": false,
+#   "document_id": null,
+#   "document_filename": "report.pdf"
+# }
 class RouteDecision(BaseModel):
     route: RouteName = Field(
         description=(
@@ -186,6 +254,16 @@ class RouteDecision(BaseModel):
             "references resolved from "
             "conversation history."
         )
+    )
+
+    need_web_search: bool = Field(
+        default=False,
+        description="Whether public web search is needed for this request.",
+    )
+
+    web_search_reason: Optional[str] = Field(
+        default=None,
+        description="Brief safe reason for web-search routing.",
     )
 
     document_id: Optional[int] = Field(
@@ -335,6 +413,14 @@ external
 不需要实时外部数据，
 选择 direct。
 
+联网搜索判断：用户明确要求搜索、联网、链接、核实，或问题需要最新
+新闻、价格、汇率、比赛、航班、近期产品/API/政策版本时，选择 external
+并将 need_web_search 设为 true。稳定概念、代码原理、翻译、写作和头脑风暴
+选择 direct。天气、时间和 GitHub 请求使用专用 MCP，need_web_search 为 false。
+涉及我的文档、知识库、上传文件、项目资料或 Workspace 文档事实时优先
+knowledge；除非用户明确要求网上核实或补充外部资料，否则不得绕过知识库。
+两者都需要时选择 knowledge 并设置 need_web_search 为 true。
+
 ==================================================
 delete_document
 ==================================================
@@ -411,6 +497,18 @@ document_filename = report.pdf
 task = 删除 report.pdf。
 """.strip()
 
+#时间问题注入运行时日期
+def get_runtime_time_prompt(context: AgentContext) -> str:
+    return (
+        "当前运行时北京时间（所有相对日期必须以此为准）：\n"
+        f"当前时间：{context.get('current_datetime')}（{context.get('timezone')}，北京时间）\n"
+        f"今天：{context.get('current_date')}\n"
+        f"昨天：{context.get('yesterday_date')}\n"
+        f"明天：{context.get('tomorrow_date')}\n"
+        "“今天、昨天、明天、近期、最新”等相对时间必须以以上信息为准。"
+        "新闻问题必须路由到 external 并设置 need_web_search=true，不能因模型自行判断日期未来而拒绝搜索。"
+    )
+
 
 CHAT_SYSTEM_PROMPT = """
 你是 NodAgent 最终负责与用户交流的 Chat Agent。
@@ -429,8 +527,9 @@ CHAT_SYSTEM_PROMPT = """
    可以直接依据长期记忆回答，
    不要求再次查询知识库。
 
-3. 如果 Knowledge Agent 返回了
-   [1]、[2] 等来源编号，应保留。
+3. 本地知识库的 [1]、[2] 等引用编号必须原样保留，不能新增、删除或改写。
+   网页资料必须保留已有的 Markdown 原始链接；不要把网页来源写成
+   “### 参考来源\n[1] 网站名”这类不能点击的编号列表。
 
 4. 如果操作节点告诉你操作成功，
    明确说明操作已经完成。
@@ -452,9 +551,27 @@ CHAT_SYSTEM_PROMPT = """
 
 9. direct 路由没有 specialist_answer 时，
    直接根据聊天历史回答用户。
+
+10. 对联网资讯默认提炼 3 至 5 条重点；每条说明事件、意义和来源。
+    每条用 1 至 2 句，总正文控制在约 1,200 个中文字符内。
+    优先保证结论完整收束，不要因罗列过多细节而中断在半句。
 """.strip()
 
 
+INCOMPLETE_ANSWER_SUFFIX = (
+    "\n\n回答因输出长度限制未完成，请回复“继续”。"
+)
+
+# 获取路由模型
+#会返回一个 ChatOpenAI 对象，带有结构化输出 RouteDecision 的功能
+#类似：
+#RouteDecision(
+#     route="external",
+#     task="搜索并总结今天苏州地区与人工智能相关的新闻，提供原始网页链接。",
+#     need_web_search=True,
+#     document_id=None,
+#     document_filename=None
+# )
 @lru_cache(maxsize=1)
 def get_router_model():
     return (
@@ -680,22 +797,27 @@ def extract_documents(
         documents_by_id.values()
     )
 
-
+#主工作流的第一个节点。它的任务不是回答用户，而是：
+# 1. 读取聊天记录、长期记忆和当前时间；
+# 2. 调用 LLM Router，得到结构化的路由决定；
+# 3. 用代码规则修正模型可能做错的判断；
+# 4. 将路由结果和本轮初始状态写回 MainGraphState
 async def router_node(
-    state: MainGraphState,
-    runtime: Runtime[
+    state: MainGraphState,#当前工作流状态
+    runtime: Runtime[#运行时上下文
         AgentContext
     ],
 ):
+    #从共享状态中取出完整聊天记录
     messages = state.get(
-        "messages",
-        [],
+        "messages",#若 messages 存在，返回它
+        [],#若 messages 不存在，返回空列表
     )
-
+    #构造 Router 的基础提示词（定义六种路由什么情况选择+当时的北京时间）
     router_system_prompt = (
-        ROUTER_SYSTEM_PROMPT
+        ROUTER_SYSTEM_PROMPT + "\n\n" + get_runtime_time_prompt(runtime.context)
     )
-
+    #从运行时上下文中取出长期记忆提示词（如果存在）
     memory_prompt = (
         runtime.context.get(
             "memory_prompt",
@@ -720,24 +842,33 @@ async def router_node(
             "才选择 knowledge。"
         )
 
-    decision = await (
+    #调用 Router 模型，得到路由决策
+    #decision 是 RouteDecision 对象，包含 route、task、need_web_search、document_id、document_filename 等属性
+    decision = await (#await 表示等待异步 LLM 调用返回
         get_router_model().ainvoke(
             [
                 SystemMessage(
                     content=(
                         router_system_prompt
+                        #包括SystemMessage：路由规则 + 当前时间 + 长期记忆
+                        #HumanMessage / AIMessage：完整聊天历史
                     )
                 ),
-                *messages,
+                *messages,#messages 是 Python 的列表解包，相当于把 messages 列表中的每个消息对象逐个放进新列表。
             ]
         )
     )
-
+    #从历史消息中倒序找到最新一条 HumanMessage 的文本
     latest_question = get_latest_user_message(messages)
 
     route = decision.route
     task = decision.task
+    need_web_search = (#LLM判断或者关键词命中，只要一个true就是需要联网搜索
+        decision.need_web_search
+        or should_request_web_search(latest_question)
+    )
 
+    #规则1：如果路由是 direct 或 external，但问题是文档事实问题，则强制改为 knowledge
     if (
         route in ("direct", "external")
         and should_route_fact_question_to_knowledge(
@@ -750,6 +881,21 @@ async def router_node(
         )
         route = "knowledge"
         task = latest_question
+
+    #规则2：如果路由不是 knowledge，但问题是文档事实问题，则强制改为 knowledge
+    if should_route_fact_question_to_knowledge(latest_question):
+        route = "knowledge"
+    #规则3：如果路由不是 knowledge，但需要联网搜索，则强制改为 external
+    if route != "knowledge" and need_web_search:
+        route = "external"
+    #规则4：如果路由是 knowledge，但问题不需要联网搜索，则强制改为 direct
+    if route == "knowledge" and not should_request_web_search(latest_question):
+        need_web_search = False
+
+    logger.warning(
+        "router_decision request_id=%s route=%s need_web_search=%s specialist_task=%r",
+        runtime.context.get("request_id", "unknown"), route, need_web_search, task[:500],
+    )
 
     return {
         "route": route,
@@ -770,11 +916,17 @@ async def router_node(
 
         "specialist_agent": "",
 
+        "need_web_search": need_web_search,
+
+        "knowledge_answer": "",
+
         "sources": [],
 
         "retrieved_sources": [],
 
         "cited_sources": [],
+
+        "answer_incomplete": False,
 
         "documents": [],
 
@@ -783,6 +935,7 @@ async def router_node(
         "action_approved": False,
 
         "pending_action": {},
+        "external_status": {},
     }
 
 
@@ -792,6 +945,15 @@ def route_after_router(
     return state["route"]
 
 
+def route_after_knowledge(
+    state: MainGraphState,
+) -> Literal["external", "chat"]:
+    return "external" if state.get("need_web_search", False) else "chat"
+
+#将 specialist_task 交给 Knowledge Agent
+#1.取出知识 Agent 最后的 AI 回复；
+#2.从工具消息的 artifact["sources"] 中提取检索来源；
+#3.检查最终回答是否真的引用了这些来源。
 async def knowledge_node(
     state: MainGraphState,
     runtime: Runtime[
@@ -871,6 +1033,7 @@ async def knowledge_node(
             "knowledge"
         ),
         "specialist_answer": answer,
+        "knowledge_answer": answer,
         # The retrieved set remains available to the final Chat Agent, while
         # sources/cited_sources are safe to expose outside the graph.
         "retrieved_sources": retrieved_sources,
@@ -879,7 +1042,12 @@ async def knowledge_node(
         "documents": [],
     }
 
-
+#文档管理查询
+#调用 Document Agent，适合处理：
+# - 有哪些文件；
+# - 某文档状态；
+# - 文档处理是否完成；
+# - 某文档被切成多少个 Chunk。
 async def document_node(
     state: MainGraphState,
     runtime: Runtime[
@@ -945,7 +1113,12 @@ async def document_node(
         "documents": documents,
     }
 
-
+#长期记忆管理
+#调用 Memory Agent，用于处理：
+# - “记住我希望分步骤讲解”
+# - “以后只给关键修改”
+# - “你记得我什么？”
+# - “忘掉某条偏好”
 async def memory_node(
     state: MainGraphState,
     runtime: Runtime[
@@ -1007,9 +1180,17 @@ async def memory_node(
         "documents": [],
     }
 
-
+#外部 MCP 与联网搜索
+#负责：
+# - 天气、时间；
+# - GitHub 仓库、Issue、PR、文件；
+# - Tavily 等联网搜索；
+# - 最新新闻、价格、API 版本等。
+#如果一个问题既需要知识库内容，又需要网络补充，会先执行
+#Knowledge Agent → External Agent → Chat Agent
 async def external_node(
     state: MainGraphState,
+    runtime: Runtime[AgentContext],
 ):
     task = state.get(
         "specialist_task",
@@ -1026,22 +1207,55 @@ async def external_node(
             )
         )
 
-    answer = await (
+    result = await (
         run_external_agent(
-            task
+            task,
+            need_web_search=state.get("need_web_search", False),
+            return_result=True,
+            runtime_context=runtime.context,
         )
     )
 
+    knowledge_answer = state.get("knowledge_answer", "")
+    retrieved_sources = state.get("retrieved_sources", [])
+    web_sources = result.retrieved_web_sources
+
+    if knowledge_answer and web_sources:
+        max_document_number = max(
+            (int(source["source_number"]) for source in retrieved_sources),
+            default=0,
+        )
+        web_sources = shift_web_sources(web_sources, max_document_number)
+        answer = (
+            "知识库内容：\n" f"{knowledge_answer}\n\n"
+            "网络补充内容（截至检索时）：\n"
+            f"{shift_citations(result.answer, max_document_number)}"
+        )
+    elif knowledge_answer:
+        answer = f"知识库内容：\n{knowledge_answer}\n\n网络补充内容：\n{result.answer}"
+    else:
+        answer = result.answer
+
     return {
         "specialist_agent": (
-            "external"
+            "knowledge_and_web" if knowledge_answer else "external"
         ),
         "specialist_answer": answer,
+        "retrieved_sources": retrieved_sources + web_sources,
+        "cited_sources": [],
         "sources": [],
         "documents": [],
+        "answer_incomplete": result.incomplete,
+        "external_status": {
+            "state": result.web_search_status,
+            "message": result.web_search_message,
+            "result_count": result.web_result_count,
+            "url_count": result.web_url_count,
+        },
     }
 
-
+#文档删除准备
+#prepare_delete → confirm_delete → execute_delete → chat
 async def prepare_delete_node(
     state: MainGraphState,
     runtime: Runtime[
@@ -1421,7 +1635,8 @@ async def execute_delete_node(
         "sources": [],
     }
 
-
+#所有专业节点处理完，不会直接把原始结果扔给用户，而是进入 chat_node
+#根据原始聊天记录、专业节点结果、相关引用结果和长期记忆，生成最终用户回答
 async def chat_node(
     state: MainGraphState,
     runtime: Runtime[
@@ -1443,7 +1658,7 @@ async def chat_node(
     )
 
     system_prompt = (
-        CHAT_SYSTEM_PROMPT
+        CHAT_SYSTEM_PROMPT + "\n\n" + get_runtime_time_prompt(runtime.context)
     )
 
     memory_prompt = (
@@ -1486,44 +1701,135 @@ async def chat_node(
             "最终用户回答。"
         )
 
-    response = await (
-        get_chat_model().ainvoke(
-            [
-                SystemMessage(
-                    content=(
-                        system_prompt
-                    )
-                ),
-                *state.get(
-                    "messages",
-                    [],
-                ),
-            ]
-        )
+    model_messages = [
+        SystemMessage(
+            content=system_prompt
+        ),
+        *state.get("messages", []),
+    ]
+    input_chars = sum(
+        len(get_message_text(message))
+        for message in model_messages
     )
+    answer_incomplete = state.get("answer_incomplete", False)
+
+    if answer_incomplete:
+        response = AIMessage(
+            content=(
+                specialist_answer.rstrip()
+                + INCOMPLETE_ANSWER_SUFFIX
+            )
+        )
+        logger.warning(
+            "Final Chat Agent skipped regeneration because the external "
+            "answer ended due to output length"
+        )
+    else:
+        response = await get_chat_model().ainvoke(model_messages)
+        finish_reason = get_finish_reason(response)
+        logger.warning(
+            "final_answer_completed request_id=%s model=%s input_messages=%d "
+            "input_chars=%d specialist_chars=%d output_chars=%d "
+            "finish_reason=%s",
+            runtime.context.get("request_id", "unknown"), LLM_MODEL,
+            len(model_messages),
+            input_chars,
+            len(specialist_answer),
+            len(get_message_text(response)),
+            finish_reason or "unknown",
+        )
+        if is_length_limited(response):
+            answer_incomplete = True
+            response = AIMessage(
+                content=(
+                    get_message_text(response).rstrip()
+                    + INCOMPLETE_ANSWER_SUFFIX
+                ),
+                response_metadata={
+                    "finish_reason": finish_reason,
+                },
+            )
+            logger.warning(
+                "Final Chat Agent output hit its length limit; "
+                "marking the SSE response incomplete"
+            )
 
     cited_sources = state.get(
         "cited_sources",
         [],
     )
+    retrieved_sources = state.get(
+        "retrieved_sources",
+        [],
+    )
 
-    if specialist_agent == "knowledge":
-        cited_sources = (
-            citation_service.filter_cited_sources(
-                get_message_text(response),
-                state.get("retrieved_sources", []),
+    if retrieved_sources:
+        answer = get_message_text(response)
+        formatted_answer = (
+            citation_service.render_web_citations(
+                answer,
+                retrieved_sources,
             )
         )
+        cited_sources = (
+            citation_service.filter_cited_sources(
+                formatted_answer,
+                retrieved_sources,
+            )
+        )
+        document_sources = [
+            source
+            for source in retrieved_sources
+            if source.get("source_type") == "document"
+        ]
+        web_sources = [
+            source
+            for source in retrieved_sources
+            if source.get("source_type") == "web"
+        ]
+        cited_document_sources = [
+            source
+            for source in cited_sources
+            if source.get("source_type") == "document"
+        ]
 
-        if not cited_sources:
+        if (
+            document_sources
+            and state.get("knowledge_answer")
+            and not cited_document_sources
+        ):
             logger.warning(
-                "Final Chat Agent answer omitted usable knowledge citations."
+                "Final Chat Agent answer omitted usable document citations."
             )
             response = AIMessage(
                 content=(
-                    "当前知识库未返回可引用的内容，"
+                    "当前检索结果未返回可引用的内容，"
                     "暂时无法基于文档回答。"
                 )
+            )
+            cited_sources = []
+        elif web_sources and not any(
+            source.get("source_type") == "web"
+            for source in cited_sources
+        ):
+            logger.warning(
+                "Final Chat Agent answer omitted usable web URLs."
+            )
+            response = AIMessage(
+                content=(
+                    "联网检索未返回可追溯的原始网页链接，"
+                    "暂时无法基于该检索结果回答。"
+                )
+            )
+            cited_sources = []
+        elif formatted_answer != answer:
+            response = AIMessage(
+                content=formatted_answer,
+                response_metadata=getattr(
+                    response,
+                    "response_metadata",
+                    {},
+                ),
             )
 
     return {
@@ -1532,9 +1838,10 @@ async def chat_node(
         ],
         "cited_sources": cited_sources,
         "sources": cited_sources,
+        "answer_incomplete": answer_incomplete,
     }
 
-
+#编排graph
 def build_main_graph(
     checkpointer,
 ):
@@ -1621,9 +1928,10 @@ def build_main_graph(
         },
     )
 
-    graph.add_edge(
+    graph.add_conditional_edges(
         "knowledge",
-        "chat",
+        route_after_knowledge,
+        {"external": "external", "chat": "chat"},
     )
 
     graph.add_edge(

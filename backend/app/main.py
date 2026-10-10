@@ -43,12 +43,17 @@ from backend.app.api.router import (#导入 API 路由
 from backend.app.graphs.main_graph import (
     build_main_graph,
 )
+from backend.app.services.mcp_service import (
+    log_github_mcp_startup_diagnostics,
+)
 
 
 @asynccontextmanager
 async def lifespan(#应用启动时构建 Agent 工作流
     app: FastAPI,
 ):
+    await log_github_mcp_startup_diagnostics()
+
     #1.连接PostgreSQL数据库，创建检查点保存器 AsyncPostgresSaver
     #2.用 async with 确保 FastAPI 关闭时连接能正确释放
     async with (

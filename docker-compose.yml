@@ -219,6 +219,12 @@ services:
       redis:
         condition: service_healthy
 
+      # The worker currently processes documents only, but it shares the MCP
+      # client image and environment with backend. Keep startup/network
+      # assumptions explicit for future worker-side external tasks.
+      github-mcp:
+        condition: service_started
+
     restart: unless-stopped
 
 
