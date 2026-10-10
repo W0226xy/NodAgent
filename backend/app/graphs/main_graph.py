@@ -97,9 +97,15 @@ WEB_SEARCH_MARKERS = (
     "航班", "verify", "search", "latest", "news",
 )
 
-KNOWLEDGE_FACT_MARKERS = (
+KNOWLEDGE_CONTEXT_MARKERS = (
     "知识库",
     "文档",
+    "上传文件",
+    "workspace",
+    "项目资料",
+)
+
+KNOWLEDGE_FACT_MARKERS = (
     "在哪里",
     "位于",
     "地址",
@@ -111,7 +117,8 @@ KNOWLEDGE_FACT_MARKERS = (
     "how many",
 )
 
-#防止“文档事实问题”误走外部服务
+# 防止“文档事实问题”误走外部服务。文档/知识库本身只是上下文，
+# 还必须同时出现事实型问法；否则“删除这个文档”等操作会被误判。
 def should_route_fact_question_to_knowledge(
     question: str,#用户问题
 ) -> bool:
@@ -130,10 +137,15 @@ def should_route_fact_question_to_knowledge(
     ):
         return False
 
-    return any(#检查是否包含知识库事实关键词
+    has_knowledge_context = any(
+        marker in normalized
+        for marker in KNOWLEDGE_CONTEXT_MARKERS
+    )
+    has_fact_question = any(#检查是否包含知识库事实关键词
         marker in normalized
         for marker in KNOWLEDGE_FACT_MARKERS
     )
+    return has_knowledge_context and has_fact_question
 
 #用户明确说“搜索、新闻、最新”时，强制联网
 def should_request_web_search(question: str) -> bool:
@@ -170,6 +182,42 @@ RouteName = Literal[
     "external",
     "delete_document",
 ]
+
+
+def finalize_router_route(
+    route: RouteName,#Router LLM 初步判断的路由
+    question: str,#用户问题
+    need_web_search: bool,#Router LLM 初步判断是否需要联网搜索
+) -> tuple[RouteName, bool, Optional[str]]:
+    """Apply deterministic guards without overriding explicit operations.
+
+    The model owns semantic classification. These guards only correct document
+    fact questions sent to direct/external and explicit web requests sent to
+    direct. Document, memory, and delete routes remain higher-priority actions.
+    """
+    #判断用户是否明确要求联网搜索
+    explicit_web_search = should_request_web_search(question)
+    #判断是否是知识库事实问题
+    is_knowledge_fact_question = should_route_fact_question_to_knowledge(question)
+    override_reason = None
+    #如果路由是 direct 或 external，并且是知识库事实问题，则强制改为 knowledge 路由
+    if route in ("direct", "external") and is_knowledge_fact_question:
+        route = "knowledge"
+        override_reason = "knowledge_fact_guard"
+    #如果路由是 direct，并且用户明确要求联网搜索，则强制改为 external 路由
+    elif route in ("direct", "external") and need_web_search:
+        route = "external"
+        override_reason = "explicit_web_search"
+
+    # Explicit operation routes do not execute public searches. Knowledge
+    # questions can request web supplementation, but a plain Workspace fact
+    # question must not trigger an unnecessary public search.
+    if route in ("document", "memory", "delete_document"):
+        need_web_search = False
+    if route == "knowledge" and not explicit_web_search:
+        need_web_search = False
+
+    return route, need_web_search, override_reason
 
 #整条工作流共享的状态
 class MainGraphState(
@@ -803,7 +851,7 @@ def extract_documents(
 # 3. 用代码规则修正模型可能做错的判断；
 # 4. 将路由结果和本轮初始状态写回 MainGraphState
 async def router_node(
-    state: MainGraphState,#当前工作流状态
+    state: MainGraphState,#当前工作流状态，state预期收到一个MainGraphState 类型的对象
     runtime: Runtime[#运行时上下文
         AgentContext
     ],
@@ -861,40 +909,37 @@ async def router_node(
     #从历史消息中倒序找到最新一条 HumanMessage 的文本
     latest_question = get_latest_user_message(messages)
 
-    route = decision.route
+    model_route = decision.route
+    route = model_route
     task = decision.task
     need_web_search = (#LLM判断或者关键词命中，只要一个true就是需要联网搜索
         decision.need_web_search
         or should_request_web_search(latest_question)
     )
 
-    #规则1：如果路由是 direct 或 external，但问题是文档事实问题，则强制改为 knowledge
-    if (
-        route in ("direct", "external")
-        and should_route_fact_question_to_knowledge(
-            latest_question
-        )
-    ):
-        logger.info(
-            "Router override: route=%s -> knowledge for document fact question",
-            route,
-        )
+    route, need_web_search, override_reason = finalize_router_route(
+        route,
+        latest_question,
+        need_web_search,
+    )
+    #路由是 direct 或 external，并且是知识库事实问题，则强制改为 knowledge 路由
+    if override_reason == "knowledge_fact_guard":
+        # The raw question is a safer standalone task than a task generated
+        # for the incorrect direct/external route.
         route = "knowledge"
         task = latest_question
 
-    #规则2：如果路由不是 knowledge，但问题是文档事实问题，则强制改为 knowledge
-    if should_route_fact_question_to_knowledge(latest_question):
-        route = "knowledge"
-    #规则3：如果路由不是 knowledge，但需要联网搜索，则强制改为 external
-    if route != "knowledge" and need_web_search:
-        route = "external"
-    #规则4：如果路由是 knowledge，但问题不需要联网搜索，则强制改为 direct
-    if route == "knowledge" and not should_request_web_search(latest_question):
-        need_web_search = False
-
     logger.warning(
-        "router_decision request_id=%s route=%s need_web_search=%s specialist_task=%r",
-        runtime.context.get("request_id", "unknown"), route, need_web_search, task[:500],
+        "router_decision request_id=%s model_route=%s final_route=%s "
+        "need_web_search=%s override_reason=%s web_search_reason=%r "
+        "specialist_task=%r",
+        runtime.context.get("request_id", "unknown"),
+        model_route,
+        route,
+        need_web_search,
+        override_reason,
+        decision.web_search_reason,
+        task[:500],
     )
 
     return {
@@ -938,11 +983,12 @@ async def router_node(
         "external_status": {},
     }
 
-
+#LangGraph 的条件路由函数：从当前工作流状态中读出 Router 已经决定好的路由名称，交给图框架选择下一个节点。
 def route_after_router(
     state: MainGraphState,
 ) -> RouteName:
-    return state["route"]
+    return state["route"]#直接取出 "route" 对应的值并返回。
+    # 比如，如果 state["route"] 是 "knowledge"，那么函数就返回 "knowledge"。
 
 
 def route_after_knowledge(
@@ -954,17 +1000,18 @@ def route_after_knowledge(
 #1.取出知识 Agent 最后的 AI 回复；
 #2.从工具消息的 artifact["sources"] 中提取检索来源；
 #3.检查最终回答是否真的引用了这些来源。
-async def knowledge_node(
+async def knowledge_node(#知识库问答节点
     state: MainGraphState,
     runtime: Runtime[
         AgentContext
     ],
 ):
     task = state.get(
-        "specialist_task",
+        "specialist_task",#这里的具体任务是 Router 节点生成的、完整可理解的任务描述
         "",
     )
 
+    #如果 specialist_task 为空，则从聊天记录中取出最新一条用户消息作为任务
     if not task:
         task = (
             get_latest_user_message(
@@ -974,7 +1021,7 @@ async def knowledge_node(
                 )
             )
         )
-
+    #调用知识库专业 Agent，传入任务和运行时上下文，得到结果
     result = await (
         get_knowledge_agent()
         .ainvoke(
@@ -988,22 +1035,22 @@ async def knowledge_node(
             context=runtime.context,
         )
     )
-
+    #从结果中提取消息
     messages = result.get(
         "messages",
         [],
     )
-
+    #从消息中取出最新的 AI 回复作为最终回答
     answer = (
         get_latest_ai_answer(
             messages
         )
     )
-
+    #从消息中提取检索来源
     retrieved_sources = extract_sources(
         messages
     )
-
+    #检查最终回答是否真的引用了这些来源
     cited_sources = (
         citation_service.filter_cited_sources(
             answer,
@@ -1028,7 +1075,7 @@ async def knowledge_node(
             "没有生成有效回答。"
         )
 
-    return {
+    return {#将结果写回主图 State
         "specialist_agent": (
             "knowledge"
         ),
@@ -1054,11 +1101,12 @@ async def document_node(
         AgentContext
     ],
 ):
+    #specialist_task 通常由前面的 router_node 生成
     task = state.get(
         "specialist_task",
         "",
     )
-
+    #如果 specialist_task 为空，则从聊天记录中取出最新一条用户消息作为任务
     if not task:
         task = (
             get_latest_user_message(
@@ -1068,9 +1116,9 @@ async def document_node(
                 )
             )
         )
-
+    #调用文档专业 Agent，传入任务和运行时上下文，得到结果
     result = await (
-        get_document_agent()
+        get_document_agent()#这里会额外提供2个工具：list_workspace_documents，get_document_details。方便文档查询
         .ainvoke(
             {
                 "messages": [
@@ -1082,18 +1130,18 @@ async def document_node(
             context=runtime.context,
         )
     )
-
+    #从结果中提取消息
     messages = result.get(
         "messages",
         [],
     )
-
+    #从消息中取出最新的 AI 回复作为最终回答
     answer = (
         get_latest_ai_answer(
             messages
         )
     )
-
+    #从消息中提取文档信息
     documents = extract_documents(
         messages
     )
@@ -1125,11 +1173,12 @@ async def memory_node(
         AgentContext
     ],
 ):
+    #specialist_task 通常由前面的 router_node 生成
     task = state.get(
         "specialist_task",
         "",
     )
-
+    #如果 specialist_task 为空，则从聊天记录中取出最新一条用户消息作为任务
     if not task:
         task = (
             get_latest_user_message(
@@ -1139,9 +1188,9 @@ async def memory_node(
                 )
             )
         )
-
+    #调用长期记忆专业 Agent，传入任务和运行时上下文，得到结果
     result = await (
-        get_memory_agent()
+        get_memory_agent()#额外提供save_memory、list_memories、delete_memory等工具，方便长期记忆管理
         .ainvoke(
             {
                 "messages": [
@@ -1192,11 +1241,12 @@ async def external_node(
     state: MainGraphState,
     runtime: Runtime[AgentContext],
 ):
+    #获取待执行任务
     task = state.get(
         "specialist_task",
         "",
     )
-
+    #如果为空，则回退到用户最新消息：
     if not task:
         task = (
             get_latest_user_message(
@@ -1206,7 +1256,7 @@ async def external_node(
                 )
             )
         )
-
+    #调用 External Agent，主要负责调用外部 MCP 工具，比如Github Mcp、Tavily MCP
     result = await (
         run_external_agent(
             task,
@@ -1216,10 +1266,14 @@ async def external_node(
         )
     )
 
+    #情况1：只需要外部信息，不需要查知识库
+    #情况2：本地知识库 + 网络补充
+    #读取前面知识库节点留下的内容（比如用户问：总结我的项目，并联网补充相关技术的最新趋势）
     knowledge_answer = state.get("knowledge_answer", "")
     retrieved_sources = state.get("retrieved_sources", [])
     web_sources = result.retrieved_web_sources
 
+    #如果知识库引用和联网搜索的引用出现序号冲突，则优先展示本地文档，联网的引用序号往后移
     if knowledge_answer and web_sources:
         max_document_number = max(
             (int(source["source_number"]) for source in retrieved_sources),
